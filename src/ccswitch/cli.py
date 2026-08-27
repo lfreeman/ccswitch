@@ -52,6 +52,24 @@ def add_cmd(
     _run(Switcher().add, label_override=label)
 
 
+@app.command("add-token")
+def add_token_cmd(
+    label: Annotated[
+        str, typer.Argument(help="Saved account label to attach the setup-token to.")
+    ],
+    token: Annotated[
+        str | None,
+        typer.Option(
+            "--token",
+            "-t",
+            help="The `claude setup-token` value. Prompted for (hidden) if omitted.",
+        ),
+    ] = None,
+) -> None:
+    """Attach a long-lived `claude setup-token` to a saved account for `exec`."""
+    _run(Switcher().add_token, label, token=token)
+
+
 @app.command("list")
 def list_cmd() -> None:
     """List saved accounts with an active marker."""

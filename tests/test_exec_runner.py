@@ -15,6 +15,7 @@ from ccswitch.accounts import Account, AccountStore
 from ccswitch import exec_runner
 from ccswitch.exec_runner import (
     CCSWITCH_KEYCHAIN_SERVICE,
+    SETUP_TOKEN_SERVICE,
     TMPDIR_PREFIX,
     _extract_oauth_fields,
     run_with_account,
@@ -369,12 +370,19 @@ def test_run_skips_refresh_when_token_fresh(
     assert refresh_called is False
 
 
-def test_run_falls_back_to_stale_blob_when_refresh_fails(
+def test_run_raises_when_expired_blob_refresh_fails(
     with_store: AccountStore,
     stub_keychain: dict,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
+    """An expired blob whose refresh token was rotated out must fail loudly.
+
+    The old behavior silently injected the dead access token, producing an
+    opaque 401 from the child. The refresh token rotates whenever the same
+    account refreshes live in Claude Code, so this is the common case — it
+    must point the user at the recovery path instead of spawning a subprocess
+    that is certain to fail.
+    """
     expired_blob = json.dumps(
         {
             "claudeAiOauth": {
@@ -387,19 +395,104 @@ def test_run_falls_back_to_stale_blob_when_refresh_fails(
     )
     stub_keychain[(CCSWITCH_KEYCHAIN_SERVICE, "work")] = expired_blob
     monkeypatch.setattr(exec_runner, "refresh_oauth_credentials", lambda _b: None)
-    monkeypatch.setattr(exec_runner, "keychain_write", lambda *_a, **_kw: None)
+
+    spawned = False
+
+    def fake_run(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal spawned
+        spawned = True
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(exec_runner.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="add-token"):
+        run_with_account("work", ["true"])
+    assert spawned is False
+
+
+# ---- run_with_account: setup-token path --------------------------------
+
+
+def test_run_uses_setup_token_when_present(
+    with_store: AccountStore, stub_keychain: dict, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored setup-token is injected as CLAUDE_CODE_OAUTH_TOKEN without any refresh."""
+    stub_keychain[(SETUP_TOKEN_SERVICE, "work")] = "sk-ant-oat01-SETUP"
+    # A blob exists too, but the token must take precedence and refresh must not run.
+    stub_keychain[(CCSWITCH_KEYCHAIN_SERVICE, "work")] = _credential_blob()
+
+    def boom(_blob: str) -> None:
+        raise AssertionError("refresh_oauth_credentials must not run on the setup-token path")
+
+    monkeypatch.setattr(exec_runner, "refresh_oauth_credentials", boom)
 
     probe = tmp_path / "probe.json"
     script = (
         "import json, os\n"
         f"open({str(probe)!r}, 'w').write(json.dumps({{"
         "'token': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),"
+        "'refresh': os.environ.get('CLAUDE_CODE_OAUTH_REFRESH_TOKEN'),"
+        "'scopes': os.environ.get('CLAUDE_CODE_OAUTH_SCOPES'),"
+        "'config_dir': os.environ.get('CLAUDE_CONFIG_DIR'),"
         "}))\n"
     )
     rc = run_with_account("work", [sys.executable, "-c", script])
     assert rc == 0
-    # Child saw the stale token — Claude Code will surface its own 401 from there.
-    assert json.loads(probe.read_text())["token"] == "STALE"
+    payload = json.loads(probe.read_text())
+    assert payload["token"] == "sk-ant-oat01-SETUP"
+    assert payload["refresh"] is None
+    assert payload["scopes"] is None
+    assert TMPDIR_PREFIX in payload["config_dir"]
+
+
+def test_run_setup_token_strips_inherited_oauth_env(
+    with_store: AccountStore,
+    stub_keychain: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Inherited refresh/scopes env from the parent must not leak into the token path.
+
+    Claude Code rejects a request where CLAUDE_CODE_OAUTH_REFRESH_TOKEN is set
+    without CLAUDE_CODE_OAUTH_SCOPES; a stale inherited refresh var would break
+    an otherwise-valid setup-token.
+    """
+    stub_keychain[(SETUP_TOKEN_SERVICE, "work")] = "sk-ant-oat01-SETUP"
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "inherited-refresh")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_SCOPES", "inherited-scope")
+
+    probe = tmp_path / "probe.json"
+    script = (
+        "import json, os\n"
+        f"open({str(probe)!r}, 'w').write(json.dumps({{"
+        "'token': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),"
+        "'refresh': os.environ.get('CLAUDE_CODE_OAUTH_REFRESH_TOKEN'),"
+        "'scopes': os.environ.get('CLAUDE_CODE_OAUTH_SCOPES'),"
+        "}))\n"
+    )
+    rc = run_with_account("work", [sys.executable, "-c", script])
+    assert rc == 0
+    payload = json.loads(probe.read_text())
+    assert payload["token"] == "sk-ant-oat01-SETUP"
+    assert payload["refresh"] is None
+    assert payload["scopes"] is None
+
+
+def test_run_setup_token_writes_scratch_claude_json(
+    with_store: AccountStore, stub_keychain: dict, tmp_path: Path
+) -> None:
+    """The setup-token path still isolates writes via a scratch CLAUDE_CONFIG_DIR."""
+    stub_keychain[(SETUP_TOKEN_SERVICE, "work")] = "sk-ant-oat01-SETUP"
+    probe = tmp_path / "probe.json"
+    script = (
+        "import json, os, pathlib\n"
+        "cfg = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']) / '.claude.json'\n"
+        f"open({str(probe)!r}, 'w').write(cfg.read_text())\n"
+    )
+    rc = run_with_account("work", [sys.executable, "-c", script])
+    assert rc == 0
+    written = json.loads(probe.read_text())
+    assert written["oauthAccount"]["emailAddress"] == "work@example.com"
 
 
 def test_run_stdio_passes_through(

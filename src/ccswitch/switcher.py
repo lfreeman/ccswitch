@@ -36,6 +36,7 @@ from ccswitch.paths import get_claude_config_path
 
 CLAUDE_CREDENTIALS_SERVICE = "Claude Code-credentials"
 CCSWITCH_KEYCHAIN_SERVICE = "ccswitch"
+SETUP_TOKEN_SERVICE = "ccswitch-token"
 KEYCHAIN_CACHE_WARNING_SECONDS = 30
 
 
@@ -80,8 +81,12 @@ class Switcher:
 
     # ---- Prompts (extracted so tests can monkey-patch on the instance) ----
 
-    def _prompt_text(self, message: str, default: str | None = None) -> str:
-        return Prompt.ask(message, default=default, console=self._console)
+    def _prompt_text(
+        self, message: str, default: str | None = None, *, password: bool = False
+    ) -> str:
+        return Prompt.ask(
+            message, default=default, password=password, console=self._console
+        )
 
     def _confirm(self, message: str, *, default: bool = False) -> bool:
         return Confirm.ask(message, default=default, console=self._console)
@@ -218,6 +223,34 @@ class Switcher:
         self._store.add(account)
         self._console.print(f"[green]Saved[/green] account '{label}' ({email}).")
 
+    def add_token(self, label: str, token: str | None = None) -> None:
+        """Attach a long-lived ``claude setup-token`` to an already-saved account.
+
+        The setup-token is what ``exec`` injects as ``CLAUDE_CODE_OAUTH_TOKEN``;
+        unlike the browser-login blob it does not share the interactive login's
+        rotating refresh chain, so it keeps working when the same account is
+        also live in Claude Code. ``token`` is prompted for (hidden) when not
+        supplied. Raises ``ValueError`` if ``label`` is not a saved account or
+        the token is empty.
+        """
+        if self._store.get(label) is None:
+            raise ValueError(
+                f"No saved account labeled {label!r}. Run `ccswitch add` first to "
+                f"save the account, then attach a token with `ccswitch add-token {label}`."
+            )
+        if token is None:
+            token = self._prompt_text(
+                f"Paste a `claude setup-token` for '{label}'", password=True
+            )
+        token = token.strip()
+        if not token:
+            raise ValueError("No token provided.")
+        keychain_write(SETUP_TOKEN_SERVICE, label, token)
+        self._console.print(
+            f"[green]Saved[/green] exec token for '{label}'. "
+            f"`ccswitch exec {label} -- claude …` will now use it."
+        )
+
     def list_accounts(self) -> None:
         """Render saved accounts with a marker on the currently-active one."""
         if len(self._store) == 0:
@@ -276,32 +309,54 @@ class Switcher:
         saved_blob = self._read_saved_blob(label)
         config = self._read_claude_config()
         saved_blob = self._refresh_if_expired(label, saved_blob)
+        # The live Keychain entry holds the currently-active account's freshest
+        # (possibly just-rotated) credentials. Read it now so we can preserve it
+        # before the write phase overwrites it. Tolerate absence — older configs
+        # or a missing entry simply mean there is nothing to preserve.
+        live_blob = keychain_read(CLAUDE_CREDENTIALS_SERVICE, self._user)
 
-        # R18: prompt to save the currently-active account if it's not saved.
+        # Identify the currently-active account against the saved set.
         active_identity = _active_identity(config)
+        active_label = None
         if active_identity is not None:
-            already_saved = any(
-                _account_identity(acc) == active_identity for acc in self._store.list()
+            active_label = next(
+                (
+                    acc.label
+                    for acc in self._store.list()
+                    if _account_identity(acc) == active_identity
+                ),
+                None,
             )
-            if not already_saved:
-                oauth = config.get("oauthAccount", {})
-                email = str(oauth.get("emailAddress", ""))
-                org_name = str(oauth.get("organizationName", ""))
-                suggested = suggest_label(email, org_name)
-                if self._confirm(
-                    f"The currently-active account ({email}) is not saved. "
-                    f"Save it as '{suggested}' before switching?",
-                    default=True,
-                ):
-                    self.add(label_override=suggested)
-                else:
-                    self._console.print(
-                        "[yellow]Aborted.[/yellow] Use `ccswitch add --label <name>` "
-                        "to save it manually."
-                    )
-                    return
+
+        if active_identity is not None and active_label is None:
+            # R18: the active account is not saved — offer to save it first so
+            # its credentials aren't lost when we overwrite the live entry.
+            oauth = config.get("oauthAccount", {})
+            email = str(oauth.get("emailAddress", ""))
+            org_name = str(oauth.get("organizationName", ""))
+            suggested = suggest_label(email, org_name)
+            if self._confirm(
+                f"The currently-active account ({email}) is not saved. "
+                f"Save it as '{suggested}' before switching?",
+                default=True,
+            ):
+                self.add(label_override=suggested)
+            else:
+                self._console.print(
+                    "[yellow]Aborted.[/yellow] Use `ccswitch add --label <name>` "
+                    "to save it manually."
+                )
+                return
 
         # ---- WRITE phase ----
+        # Re-capture the active account's live (rotated) credentials into its
+        # saved entry before we overwrite the live entry. Without this, its saved
+        # copy keeps a refresh token the live app already rotated out, so a later
+        # `use` of that account fails to refresh. Skipped when switching to the
+        # already-active account (it would only clobber its own saved copy).
+        if active_label is not None and active_label != label and live_blob:
+            keychain_write(CCSWITCH_KEYCHAIN_SERVICE, active_label, live_blob)
+
         new_config = dict(config)
         new_config["oauthAccount"] = target.oauth_account
         write_json_atomic(get_claude_config_path(), new_config)
@@ -344,5 +399,6 @@ class Switcher:
             return
 
         keychain_delete(CCSWITCH_KEYCHAIN_SERVICE, label)
+        keychain_delete(SETUP_TOKEN_SERVICE, label)
         self._store.remove(label)
         self._console.print(f"[green]Removed[/green] '{label}'.")

@@ -20,6 +20,7 @@ from ccswitch.keychain import KeychainError
 from ccswitch.switcher import (
     CCSWITCH_KEYCHAIN_SERVICE,
     CLAUDE_CREDENTIALS_SERVICE,
+    SETUP_TOKEN_SERVICE,
     Switcher,
 )
 
@@ -655,6 +656,116 @@ def test_use_warns_and_proceeds_when_refresh_fails(
     assert "re-login" in out.lower() or "ccswitch add" in out
     # Stale blob was still written through to live state (Claude Code will show its own 401).
     assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == expired
+
+
+# ---- use: re-capture active account's live credentials ------------------
+
+
+def test_use_recaptures_active_saved_account_before_switching(
+    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
+) -> None:
+    """Switching away from an active, already-saved account must save its freshest creds.
+
+    The live Keychain entry holds that account's latest (rotated) tokens; its
+    saved ccswitch copy is older and its refresh token is likely already dead.
+    `use` must re-capture the live blob into the saved entry before overwriting
+    the live entry, or the next `use` of that account fails to refresh.
+    """
+    _write_claude_config(claude_config_path, _oauth("personal@x.com", "org-p", "Personal"))
+    sw, store = _make_switcher(tmp_home)
+    store.add(
+        Account("personal", "personal@x.com", "Personal", _oauth("personal@x.com", "org-p", "Personal"))
+    )
+    store.add(Account("work", "work@x.com", "Work", _oauth("work@x.com", "org-w", "Work")))
+
+    old_personal = '{"claudeAiOauth": {"accessToken": "OLD", "refreshToken": "RT_OLD", "scopes": ["user:inference"]}}'
+    fresh_personal = '{"claudeAiOauth": {"accessToken": "NEW", "refreshToken": "RT_NEW", "scopes": ["user:inference"]}}'
+    work_blob = '{"claudeAiOauth": {"accessToken": "WORK", "refreshToken": "RT_WORK", "scopes": ["user:inference"]}}'
+    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "personal", old_personal)
+    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", work_blob)
+    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", fresh_personal)
+
+    sw.use("work")
+
+    # personal's saved copy now holds the freshest live (rotated) credentials...
+    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "personal")] == fresh_personal
+    # ...and the live entry holds work's blob (the switch happened).
+    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == work_blob
+
+
+def test_use_does_not_recapture_when_switching_to_active_account(
+    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
+) -> None:
+    """Re-using the already-active account must not clobber its own saved entry."""
+    _write_claude_config(claude_config_path, _oauth("work@x.com", "org-w", "Work"))
+    sw, store = _make_switcher(tmp_home)
+    store.add(Account("work", "work@x.com", "Work", _oauth("work@x.com", "org-w", "Work")))
+
+    saved_work = '{"claudeAiOauth": {"accessToken": "SAVED", "refreshToken": "RT", "scopes": ["user:inference"]}}'
+    live_work = '{"claudeAiOauth": {"accessToken": "LIVE", "refreshToken": "RT", "scopes": ["user:inference"]}}'
+    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", saved_work)
+    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", live_work)
+
+    sw.use("work")
+
+    # The saved entry is untouched (no spurious re-capture onto itself).
+    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "work")] == saved_work
+
+
+# ---- add_token ----------------------------------------------------------
+
+
+def _save_account(store: AccountStore, label: str = "work") -> None:
+    store.add(
+        Account(
+            label=label,
+            email="work@example.com",
+            organization_name="Example Org",
+            oauth_account=_oauth("work@example.com", "org-1", "Example Org"),
+        )
+    )
+
+
+def test_add_token_stores_token_under_token_service(
+    tmp_home: Path, fake_kc: FakeKeychain
+) -> None:
+    sw, store = _make_switcher(tmp_home)
+    _save_account(store)
+
+    sw.add_token("work", token="sk-ant-oat01-LONGLIVED")
+
+    assert fake_kc.entries[(SETUP_TOKEN_SERVICE, "work")] == "sk-ant-oat01-LONGLIVED"
+
+
+def test_add_token_requires_existing_account(
+    tmp_home: Path, fake_kc: FakeKeychain
+) -> None:
+    sw, _ = _make_switcher(tmp_home)
+    with pytest.raises(ValueError, match="No saved account"):
+        sw.add_token("ghost", token="sk-ant-oat01-X")
+
+
+def test_add_token_rejects_empty_token(tmp_home: Path, fake_kc: FakeKeychain) -> None:
+    sw, store = _make_switcher(tmp_home)
+    _save_account(store)
+    with pytest.raises(ValueError, match="[Tt]oken"):
+        sw.add_token("work", token="   ")
+
+
+def test_add_token_prompts_when_token_omitted(
+    tmp_home: Path, fake_kc: FakeKeychain
+) -> None:
+    sw, store = _make_switcher(tmp_home)
+    _save_account(store)
+
+    def fake_prompt(_message: str, **_kwargs: object) -> str:
+        return "  sk-ant-oat01-PROMPTED  "
+
+    sw._prompt_text = fake_prompt  # type: ignore[method-assign]
+    sw.add_token("work")
+
+    # Whitespace is trimmed before storing.
+    assert fake_kc.entries[(SETUP_TOKEN_SERVICE, "work")] == "sk-ant-oat01-PROMPTED"
 
 
 # ---- error propagation --------------------------------------------------
