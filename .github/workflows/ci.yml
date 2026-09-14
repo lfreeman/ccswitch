@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    # ccswitch targets macOS (it shells out to /usr/bin/security), but every test
+    # stubs subprocess, so the suite is platform-independent and runs here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - run: uv sync
+
+      - run: uv run ruff check src tests
+
+      - run: uv run pytest
